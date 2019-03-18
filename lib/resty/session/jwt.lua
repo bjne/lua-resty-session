@@ -4,7 +4,7 @@ local ffi = require "ffi"
 local C = ffi.C
 local ffi_str = ffi.string
 
-local json_decode = require "cjson.safe".decode
+--local json_decode = require "cjson.safe".decode
 local json_encode = require "cjson.safe".encode
 local b64u_decode = require "ngx.base64".decode_base64url
 local b64u_encode = require "ngx.base64".encode_base64url
@@ -82,7 +82,7 @@ local rsa_pkey = function(pem, password, private)
     end
 
     -- password?
-    
+
     local key = ffi.gc(read(bio, nil, nil, nil), C.RSA_free)
     if key == nil then
         return nil, "PEM_read_" .. (private and 'private_key' or 'public_key')
@@ -98,7 +98,7 @@ local rsa_pkey = function(pem, password, private)
     end
 
     -- todo: collect some garbage?
-    
+
     return pkey
 end
 
@@ -117,10 +117,10 @@ _M.new = function(private_key, password)
         return nil, "EVP_DigestInit_ex"
     end
 
-    local jwt = {b64u_encode('{"alg":"RS256"}')}
+    local _jwt = {b64u_encode('{"alg":"RS256"}')}
 
     local self = {
-        _jwt = jwt,
+        _jwt = _jwt,
         _pkey = pkey,
         _hdr = jwt[1] .. '.',
         _hdr_len = #jwt[1],

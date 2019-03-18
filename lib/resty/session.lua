@@ -1,8 +1,7 @@
 local _M = { _VERSION = 0.1 }
-local jwt = require "resty.openid.jwt"
+local jwt = require "resty.session.jwt"
 
 local new_tab = require "table.new"
-local clear_tab = require "table.clear"
 
 local ffi = require "ffi"
 local C = ffi.C
@@ -10,8 +9,6 @@ local ffi_str = ffi.string
 
 local b64u_decode = require "ngx.base64".decode_base64url
 local b64u_encode = require "ngx.base64".encode_base64url
-local json_decode = require "cjson.safe".decode
-local json_encode = require "cjson.safe".encode
 
 local sub = string.sub
 local concat = table.concat
@@ -93,15 +90,15 @@ _M.new = function(config)
         return nil, "EVP_DecryptInit_ex"
     end
 
-    local jwt, err = jwt.new(private_key)
-    if not jwt then
+    local _jwt, err = jwt.new(private_key)
+    if not _jwt then
         return nil, err
     end
 
     local self = {
         _iv = sub(ngx.md5_bin(cek), -12),
         _cek = cek,
-        _jwt = jwt,
+        _jwt = _jwt,
         _enc_ctx = enc_ctx,
         _dec_ctx = dec_ctx,
         _cookie_name = {'cookie_', config.cookie_name or 'me', '', '='},
@@ -215,12 +212,12 @@ function session:save(data)
         return nil, "headers_sent"
     end
 
-    local jwt, err = self._jwt:create(data)
-    if not jwt then
+    local signed, err = self._jwt:create(data)
+    if not signed then
         return nil, err
     end
 
-    local enc, err = self:encrypt(jwt)
+    local enc, err = self:encrypt(signed)
     if not enc then
         return nil, err
     end
@@ -234,21 +231,17 @@ function session:load()
         return nil, err
     end
 
-    local jwt, err = self:decrypt(cookie_data)
-    if not jwt then
+    local signed, err = self:decrypt(cookie_data)
+    if not signed then
         return nil, err
     end
 
-    local data, err = self._jwt:verify(jwt)
+    local data, err = self._jwt:verify(signed)
     if not data then
         return nil, err
     end
 
     return data
-end
-
-function session:flush()
-    ngx.var.header.set_cookie = self.cookie_name .. '=' .. 'Expire...'
 end
 
 return _M
