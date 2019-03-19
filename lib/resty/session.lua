@@ -2,6 +2,7 @@ local _M = { _VERSION = 0.1 }
 local jwt = require "resty.session.jwt"
 
 local new_tab = require "table.new"
+local clone_tab = require "table.clone"
 
 local ffi = require "ffi"
 local C = ffi.C
@@ -97,13 +98,17 @@ _M.new = function(config)
         return nil, err
     end
 
-	local params = { config.cookie_path or '/' }
-	params[params + 1] = config.cookie_httponly and 'HttpOnly'
-	params[params + 1] = config.cookie_secure and 'Secure'
-	params = concat(params, ';')
+    local cookie_name = config.cookie_name or 'me'
+    local params = { ';path=' .. (config.cookie_path or '/') }
+    params[#params + 1] = config.cookie_domain
+    params[#params + 1] = not config.cookie_httponly and nil or 'HttpOnly'
+    params[#params + 1] = config.cookie_secure and 'Secure'
+    params = concat(params, ';')
 
-    local overhead = #('expires=Thu, 01 Jan 1970 00:00:00 GMT;') + #params
-    local chunk_size = (config.chunk_size or 4000) - overhead
+    local chunk_size = (config.chunk_size or 4000)
+    	- #('Set-Cookie: ') - #cookie_name
+	- #(';expires=' .. http_time(0)) - #params
+
     if chunk_size < 200 then
         return nil, "too small chunk_size"
     end
@@ -120,13 +125,13 @@ _M.new = function(config)
         _chunk_size = chunk_size,
         _cookie = {
             'cookie_',
-            config.cookie_name or 'me',
+	    cookie_name,
             '(chunk#)',                        -- 3
             '=',
             '(cookie_value)',                  -- 5
             ';expires=',
             '(Thu, 01 Jan 1970 00:00:00 GMT)', -- 7
-            ';' .. params
+            params
         }
     }
 
@@ -186,30 +191,36 @@ end
 
 local cookie_jar = new_tab(20,0)
 function session:set_chunked_cookie(data, err)
-	if not data then
-		return nil, err
-	end
-
-	local cookie, chunk_size = self._cookie, self._chunk_size
-    -- todo: set cookie directly en encrypt?
-
-    local chunks = 0
-    cookie[8] = http_time(ngx.time() + self._ttl)
-    for chunk=0,#data/chunk_size do
-        cookie[3] = chunk == 0 and '' or chunk
-        cookie[5] = sub(data, chunk * chunk_size + 1, (chunk + 1) * chunk_size)
-        cookie_jar[chunk + 1], chunks  = concat(cookie, '', 2, 8), chunks + 1
+    if not data then
+        return nil, err
     end
 
-    if chunks > 20 then
-        return nil, "too many chunks"
+    local cookie, chunk_size = self._cookie, self._chunk_size
+
+
+    cookie[7] = http_time(ngx.time() + self._ttl)
+
+    local remaining, sent, chunks, send_len = #data, 0
+    for chunk=0,19 do
+        cookie[3] = chunk == 0 and '' or tostring(chunk)
+        send_len = chunk_size - #cookie[3] - 1
+        cookie[5] = sub(data, sent + 1, sent + send_len)
+        remaining, sent = remaining - send_len, sent + send_len
+        cookie_jar[chunk + 1], chunks = concat(cookie, '', 2, 8), chunk + 1
+
+        if remaining <= 0 then
+            break
+        end
+    end
+
+    if remaining > 0 then
+        return nil, "out of space"
     end
 
     cookie[5] = nil
     for chunk=20,chunks+1,-1 do
         cookie[3] = chunk - 1
 
-        -- todo: path!
         if not cookie[5] and ngx.var[concat(cookie, '', 1, 3)] ~= nil then
             cookie[5] = self._delete
         end
@@ -217,15 +228,13 @@ function session:set_chunked_cookie(data, err)
         cookie_jar[chunk] = cookie[5] and concat(cookie, '', 2, 5)
     end
 
-    ngx.header.Set_Cookie = cookie_jar -- todo: is this nonblocking? If so, dangerous to reuse tbl
-
-    ngx.say(concat(cookie_jar))
+    ngx.header.Set_Cookie = clone_tab(cookie_jar) -- todo: clone needed?
 
     return true
 end
 
 function session:get_chunked_cookie()
-	local cookie = self._cookie
+    local cookie = self._cookie
     for chunk=0,19 do
         cookie[3] = chunk == 0 and '' or chunk
         cookie_jar[chunk + 1] = ngx.var[concat(cookie, '', 1, 3)]
@@ -249,11 +258,11 @@ function session:save(data)
         return nil, err
     end
 
-    return session:set_chunked_cookie(self:encrypt(signed))
+    return self:set_chunked_cookie(self:encrypt(signed))
 end
 
 function session:load()
-    local cookie_data, err = session:get_chunked_cookie()
+    local cookie_data, err = self:get_chunked_cookie()
     if not cookie_data then
         return nil, err
     end
