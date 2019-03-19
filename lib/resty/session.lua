@@ -12,6 +12,8 @@ local b64u_encode = require "ngx.base64".encode_base64url
 
 local sub = string.sub
 local concat = table.concat
+local format = string.format
+local http_time = ngx.http_time
 
 ffi.cdef[[
 typedef struct evp_cipher_st EVP_CIPHER;
@@ -95,14 +97,37 @@ _M.new = function(config)
         return nil, err
     end
 
+	local params = { config.cookie_path or '/' }
+	params[params + 1] = config.cookie_httponly and 'HttpOnly'
+	params[params + 1] = config.cookie_secure and 'Secure'
+	params = concat(params, ';')
+
+    local overhead = #('expires=Thu, 01 Jan 1970 00:00:00 GMT;') + #params
+    local chunk_size = (config.chunk_size or 4000) - overhead
+    if chunk_size < 200 then
+        return nil, "too small chunk_size"
+    end
+
     local self = {
+        _ttl = config.ttl or 86400,
         _iv = sub(ngx.md5_bin(cek), -12),
         _cek = cek,
         _jwt = _jwt,
         _enc_ctx = enc_ctx,
         _dec_ctx = dec_ctx,
-        _cookie_name = {'cookie_', config.cookie_name or 'me', '', '='},
-        _chunk_size = config.chunk_size or 4000
+        _params = params,
+        _delete = format('null; path=%s; expires=%s', params[1], http_time(0)),
+        _chunk_size = chunk_size,
+        _cookie = {
+            'cookie_',
+            config.cookie_name or 'me',
+            '(chunk#)',                        -- 3
+            '=',
+            '(cookie_value)',                  -- 5
+            ';expires=',
+            '(Thu, 01 Jan 1970 00:00:00 GMT)', -- 7
+            ';' .. params
+        }
     }
 
     return setmetatable(self, session_mt)
@@ -160,30 +185,36 @@ function session:encrypt(data)
 end
 
 local cookie_jar = new_tab(20,0)
-local set_chunked_cookie = function(cookie_name, chunk_size, data)
+function session:set_chunked_cookie(data, err)
+	if not data then
+		return nil, err
+	end
+
+	local cookie, chunk_size = self._cookie, self._chunk_size
     -- todo: set cookie directly en encrypt?
 
     local chunks = 0
+    cookie[8] = http_time(ngx.time() + self._ttl)
     for chunk=0,#data/chunk_size do
-        cookie_name[3] = chunk == 0 and '' or chunk
-        cookie_name[5] = sub(data, chunk * chunk_size + 1, (chunk + 1) * chunk_size)
-        cookie_jar[chunk + 1], chunks  = concat(cookie_name, '', 2, 5), chunks + 1
+        cookie[3] = chunk == 0 and '' or chunk
+        cookie[5] = sub(data, chunk * chunk_size + 1, (chunk + 1) * chunk_size)
+        cookie_jar[chunk + 1], chunks  = concat(cookie, '', 2, 8), chunks + 1
     end
 
     if chunks > 20 then
         return nil, "too many chunks"
     end
 
-    cookie_name[5] = nil
+    cookie[5] = nil
     for chunk=20,chunks+1,-1 do
-        cookie_name[3] = chunk - 1
+        cookie[3] = chunk - 1
 
         -- todo: path!
-        if not cookie_name[5] and ngx.var[concat(cookie_name, '', 1, 3)] ~= nil then
-            cookie_name[5] = 'null; path=/session; expires=Thu, 01 Jan 1970 00:00:00 GMT'
+        if not cookie[5] and ngx.var[concat(cookie, '', 1, 3)] ~= nil then
+            cookie[5] = self._delete
         end
 
-        cookie_jar[chunk] = cookie_name[5] and concat(cookie_name, '', 2, 5)
+        cookie_jar[chunk] = cookie[5] and concat(cookie, '', 2, 5)
     end
 
     ngx.header.Set_Cookie = cookie_jar -- todo: is this nonblocking? If so, dangerous to reuse tbl
@@ -193,10 +224,11 @@ local set_chunked_cookie = function(cookie_name, chunk_size, data)
     return true
 end
 
-local get_chunked_cookie = function(cookie_name)
+function session:get_chunked_cookie()
+	local cookie = self._cookie
     for chunk=0,19 do
-        cookie_name[3] = chunk == 0 and '' or chunk
-        cookie_jar[chunk + 1] = ngx.var[concat(cookie_name, '', 1, 3)]
+        cookie[3] = chunk == 0 and '' or chunk
+        cookie_jar[chunk + 1] = ngx.var[concat(cookie, '', 1, 3)]
 
         if cookie_jar[chunk + 1] == nil then
             return chunk > 0 and concat(cookie_jar, '', 1, chunk)
@@ -217,16 +249,11 @@ function session:save(data)
         return nil, err
     end
 
-    local enc, err = self:encrypt(signed)
-    if not enc then
-        return nil, err
-    end
-
-    return set_chunked_cookie(self._cookie_name, self._chunk_size, enc)
+    return session:set_chunked_cookie(self:encrypt(signed))
 end
 
 function session:load()
-    local cookie_data, err = get_chunked_cookie(self._cookie_name)
+    local cookie_data, err = session:get_chunked_cookie()
     if not cookie_data then
         return nil, err
     end
